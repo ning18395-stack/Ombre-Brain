@@ -99,6 +99,34 @@ env_line() {
   printf '%s=%s\n' "${key}" "${value}"
 }
 
+env_file_has_value() {
+  local key="$1"
+  if [[ -n "${!key:-}" ]]; then
+    return 0
+  fi
+  [[ -f ".env" ]] || return 1
+  awk -v key="${key}" '
+    BEGIN { found = 1 }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+      split(line, pair, "=")
+      name = pair[1]
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name != key) next
+      value = substr(line, index(line, "=") + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/^["'\'']|["'\'']$/, "", value)
+      if (value != "" && value !~ /^(your-key|changeme|replace-me|xxx)$/) {
+        found = 0
+      }
+    }
+    END { exit found }
+  ' ".env"
+}
+
 trim() {
   local value="$1"
   value="${value#"${value%%[![:space:]]*}"}"
@@ -538,6 +566,13 @@ ensure_mobile_tools() {
   return 0
 }
 
+select_deploy_target_for_task() {
+  local title="$1"
+  choose_deploy_target
+  line
+  printf '%s：%s\n' "${title}" "${DEPLOY_LABEL}"
+}
+
 choose_client_host() {
   case "${DEPLOY_TARGET}" in
     vps)
@@ -644,6 +679,117 @@ EOF
   else
     printf '已生成 start_mobile.sh；之后可执行：./start_mobile.sh\n'
   fi
+}
+
+update_mobile_runtime() {
+  local python_cmd
+  python_cmd="$(detect_python_cmd)" || {
+    printf '未找到 python。手机部署建议先在 Termux 里执行：pkg install python git\n'
+    return 1
+  }
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'Pull latest code...\n'
+    git pull --ff-only || return 1
+  fi
+
+  if prompt_yes_no '现在安装/更新 Python 依赖吗' 'y'; then
+    "${python_cmd}" -m pip install -r requirements.txt || return 1
+  fi
+
+  printf '\n手机直跑更新完成。\n'
+  if [[ -f "start_mobile.sh" ]]; then
+    printf '如果服务已经在跑，请重启 Termux 后台服务，或手动结束旧进程后执行：./start_mobile.sh\n'
+  else
+    printf '未找到 start_mobile.sh；如尚未首次部署，请先走菜单 1。\n'
+  fi
+}
+
+doctor_mobile_runtime() {
+  local python_cmd
+  line
+  printf '手机部署错误排查\n'
+
+  if python_cmd="$(detect_python_cmd)"; then
+    printf 'OK   Python 可用：%s\n' "${python_cmd}"
+  else
+    printf 'FAIL 未找到 python。Termux 可执行：pkg install python git\n'
+  fi
+
+  if [[ -f ".env" ]]; then
+    printf 'OK   .env 存在\n'
+  else
+    printf 'WARN .env 不存在；请先走首次部署。\n'
+  fi
+
+  if [[ -f "config.yaml" ]]; then
+    printf 'OK   config.yaml 存在\n'
+  else
+    printf 'WARN config.yaml 不存在；请先走首次部署。\n'
+  fi
+
+  for key in OMBRE_API_KEY OMBRE_EMBEDDING_API_KEY OMBRE_DREAM_API_KEY OMBRE_GATEWAY_TOKEN; do
+    if env_file_has_value "${key}"; then
+      printf 'OK   %s 已配置\n' "${key}"
+    else
+      printf 'WARN %s 未配置\n' "${key}"
+    fi
+  done
+
+  if [[ -f "state/ombre-brain.pid" ]]; then
+    local brain_pid
+    brain_pid="$(cat state/ombre-brain.pid 2>/dev/null || true)"
+    if [[ -n "${brain_pid}" ]] && kill -0 "${brain_pid}" >/dev/null 2>&1; then
+      printf 'OK   ombre-brain 进程存在：%s\n' "${brain_pid}"
+    else
+      printf 'WARN ombre-brain pid 文件存在，但进程可能没在跑。\n'
+    fi
+  else
+    printf 'WARN 未找到 state/ombre-brain.pid；可能还没启动 start_mobile.sh。\n'
+  fi
+
+  if [[ -f "state/ombre-gateway.pid" ]]; then
+    local gateway_pid
+    gateway_pid="$(cat state/ombre-gateway.pid 2>/dev/null || true)"
+    if [[ -n "${gateway_pid}" ]] && kill -0 "${gateway_pid}" >/dev/null 2>&1; then
+      printf 'OK   ombre-gateway 进程存在：%s\n' "${gateway_pid}"
+    else
+      printf 'WARN ombre-gateway pid 文件存在，但进程可能没在跑。\n'
+    fi
+  else
+    printf 'WARN 未找到 state/ombre-gateway.pid；可能还没启动 start_mobile.sh。\n'
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 5 "http://127.0.0.1:8000/health" >/dev/null 2>&1; then
+      printf 'OK   Ombre-Brain health 通：http://127.0.0.1:8000/health\n'
+    else
+      printf 'WARN Ombre-Brain health 不通：http://127.0.0.1:8000/health\n'
+    fi
+    if curl -fsS --max-time 5 "http://127.0.0.1:8010/health" >/dev/null 2>&1; then
+      printf 'OK   Gateway health 通：http://127.0.0.1:8010/health\n'
+    else
+      printf 'WARN Gateway health 不通：http://127.0.0.1:8010/health\n'
+    fi
+  else
+    printf 'WARN 未找到 curl，跳过 health 检查。\n'
+  fi
+
+  for log_file in logs/ombre-brain.log logs/ombre-gateway.log; do
+    if [[ -f "${log_file}" ]]; then
+      printf '\n最近日志：%s\n' "${log_file}"
+      grep -Eai 'error|exception|traceback|401|403|429|500|502|503|504|connection refused|address already in use|api key|unauthorized|permission denied|timeout' "${log_file}" \
+        | tail -n 12 \
+        | sed 's/^/  /' || true
+    else
+      printf 'WARN 未找到日志文件：%s\n' "${log_file}"
+    fi
+  done
+
+  printf '\n手机客户端常用填写：\n'
+  printf '  Gateway Base URL: http://127.0.0.1:8010/v1\n'
+  printf '  MCP URL: http://127.0.0.1:8000/mcp\n'
+  printf '  Dashboard: http://127.0.0.1:8000/dashboard\n'
 }
 
 first_deploy() {
@@ -766,13 +912,23 @@ choose_compose_file() {
 }
 
 update_version() {
-  choose_compose_file
-  "${SCRIPT_DIR}/update_deploy.sh"
+  select_deploy_target_for_task "更新版本"
+  if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
+    update_mobile_runtime
+  else
+    choose_compose_file
+    "${SCRIPT_DIR}/update_deploy.sh"
+  fi
 }
 
 run_doctor() {
-  choose_compose_file
-  "${SCRIPT_DIR}/doctor.sh"
+  select_deploy_target_for_task "错误排查"
+  if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
+    doctor_mobile_runtime
+  else
+    choose_compose_file
+    "${SCRIPT_DIR}/doctor.sh"
+  fi
 }
 
 maintenance_menu() {
