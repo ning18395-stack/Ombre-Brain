@@ -956,7 +956,7 @@ docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_migr
 
 脚本用途：
 
-- `scripts/one_click.sh`：新手入口。菜单包含首次部署、更新版本、错误排查和 embedding 维护；首次部署会引导填写模型配置和 key，key 写入 `.env`，非密钥配置写入 `config.yaml`，并生成本机专用的 `compose.local.yml`。
+- `scripts/one_click.sh`：新手入口。菜单包含首次部署、更新版本、错误排查和 embedding 维护；首次部署会先选择 `VPS / Windows / 手机`。VPS 和 Windows 走 Docker 并生成本机专用的 `compose.local.yml`；手机按 Termux/Python 直跑并生成 `start_mobile.sh`。模型配置和 key 会交互式填写，key 写入 `.env`，非密钥配置写入 `config.yaml`，最后生成 `connection_guide.txt` 告诉客户端 URL 怎么填。
 - `scripts/doctor.sh`：适合“更新后不能用、端口不通、怀疑 key 没配好”。它只读检查，不会重启服务、不改配置、不打印 key。会提示 `.env/config.yaml`、Docker Compose 状态、健康接口、容器内环境变量和最近错误日志。
 - `scripts/update_deploy.sh`：适合“我只想更新到最新版”。它会 `git pull --ff-only`，如果 compose 里是 `build:` 就重建镜像，否则先 pull 镜像，再启动容器，最后做健康检查。
 - `scripts/embedding_backfill.sh`：只补缺失的 embedding，适合升级后发现部分记忆没有语义召回。
@@ -976,6 +976,12 @@ docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_migr
 - 单上游或多上游 provider。
 - 每个 provider 可选单 key 或多 key，多 key 会写成 `api_key_envs`。
 - 如果多个 provider 暴露了同名模型，脚本会自动把 Gateway 里显示的模型名改成 `provider/模型名`，同时保留 `upstream_model` 指向真实模型名，避免路由撞名。
+
+`one_click.sh` 的客户端提示会按部署环境给 URL：
+
+- VPS：客户端填 `http://你的公网IP或域名:18002/v1` 作为 Gateway Base URL；MCP 工具 URL 是 `http://你的公网IP或域名:18001/mcp`。公网使用时记得放行端口，长期使用建议反代到 HTTPS。
+- Windows：客户端在同一台电脑就填 `127.0.0.1`；手机连 Windows 时填 Windows 的局域网 IP，并允许防火墙通过端口。
+- 手机：按 Termux/Python 直跑处理。同一台手机填 `127.0.0.1`；其它设备连手机时填手机局域网 IP，并保持 Termux 后台运行。
 
 ## 本地开发与测试
 

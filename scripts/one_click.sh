@@ -7,6 +7,11 @@ source "${SCRIPT_DIR}/_ops_common.sh"
 cd "$(ombre_repo_root)"
 
 LOCAL_COMPOSE_FILE="compose.local.yml"
+DEPLOY_TARGET="vps"
+DEPLOY_LABEL="VPS 部署"
+DEFAULT_BRAIN_PORT="18001"
+DEFAULT_GATEWAY_PORT="18002"
+CLIENT_HOST="127.0.0.1"
 
 line() {
   printf '%s\n' '------------------------------------------------------------'
@@ -419,7 +424,7 @@ dream:
   attempt_threshold: 0.45
   spontaneous_surface_prob: 0.02
 
-# Host ports used by compose.local.yml:
+# Client URL hints:
 #   Ombre-Brain: http://127.0.0.1:${brain_port}
 #   Gateway:     http://127.0.0.1:${gateway_port}
 EOF
@@ -485,12 +490,178 @@ ensure_tools() {
   return 0
 }
 
-first_deploy() {
+choose_deploy_target() {
+  local choice
   line
-  printf '首次部署会生成 .env、config.yaml、%s，并启动容器。\n' "${LOCAL_COMPOSE_FILE}"
+  printf '选择部署环境\n'
+  printf '1. VPS 部署（Docker，适合服务器/云主机）\n'
+  printf '2. Windows 部署（Docker Desktop + Git Bash）\n'
+  printf '3. 手机部署（Termux / Python 直跑）\n'
+  read -r -p '输入（1-3）：' choice
+  case "${choice}" in
+    2)
+      DEPLOY_TARGET="windows"
+      DEPLOY_LABEL="Windows 部署"
+      DEFAULT_BRAIN_PORT="18001"
+      DEFAULT_GATEWAY_PORT="18002"
+      ;;
+    3)
+      DEPLOY_TARGET="mobile"
+      DEPLOY_LABEL="手机部署"
+      DEFAULT_BRAIN_PORT="8000"
+      DEFAULT_GATEWAY_PORT="8010"
+      ;;
+    *)
+      DEPLOY_TARGET="vps"
+      DEPLOY_LABEL="VPS 部署"
+      DEFAULT_BRAIN_PORT="18001"
+      DEFAULT_GATEWAY_PORT="18002"
+      ;;
+  esac
+}
+
+detect_python_cmd() {
+  if command -v python3 >/dev/null 2>&1; then
+    printf 'python3\n'
+  elif command -v python >/dev/null 2>&1; then
+    printf 'python\n'
+  else
+    return 1
+  fi
+}
+
+ensure_mobile_tools() {
+  if ! detect_python_cmd >/dev/null 2>&1; then
+    printf '未找到 python。手机部署建议先在 Termux 里执行：pkg install python git\n'
+    return 1
+  fi
+  return 0
+}
+
+choose_client_host() {
+  case "${DEPLOY_TARGET}" in
+    vps)
+      CLIENT_HOST="$(prompt_text '客户端访问用的 VPS 公网 IP 或域名' '<你的VPS公网IP或域名>')"
+      ;;
+    windows)
+      if prompt_yes_no '客户端就在这台 Windows 电脑上吗' 'y'; then
+        CLIENT_HOST="127.0.0.1"
+      else
+        CLIENT_HOST="$(prompt_text 'Windows 电脑的局域网 IP（手机同 Wi-Fi 时使用）' '<Windows局域网IP>')"
+      fi
+      ;;
+    mobile)
+      if prompt_yes_no '客户端就在这台手机上吗' 'y'; then
+        CLIENT_HOST="127.0.0.1"
+      else
+        CLIENT_HOST="$(prompt_text '手机的局域网 IP（其它设备同 Wi-Fi 时使用）' '<手机局域网IP>')"
+      fi
+      ;;
+  esac
+}
+
+print_client_guide() {
+  local brain_port="$1"
+  local gateway_port="$2"
+  local mcp_url="http://${CLIENT_HOST}:${brain_port}/mcp"
+  local dashboard_url="http://${CLIENT_HOST}:${brain_port}/dashboard"
+  local gateway_base_url="http://${CLIENT_HOST}:${gateway_port}/v1"
+
+  line
+  printf '客户端填写方式\n'
+  printf 'Dashboard: %s\n' "${dashboard_url}"
+  printf 'MCP 工具模式 URL: %s\n' "${mcp_url}"
+  printf 'Gateway / OpenAI-compatible Base URL: %s\n' "${gateway_base_url}"
+  printf 'Gateway API Key: .env 里的 OMBRE_GATEWAY_TOKEN\n'
+  printf '模型名: 客户端可从 %s/models 读取；同名模型会显示成 provider/模型名。\n' "${gateway_base_url}"
+  printf '会话头: 如果客户端支持自定义 header，可加 X-Ombre-Session-Id: main\n'
+
+  case "${DEPLOY_TARGET}" in
+    vps)
+      printf '\nVPS 提醒：安全组/防火墙要放行端口 %s 和 %s；公网长期使用更建议反代到 HTTPS。\n' "${brain_port}" "${gateway_port}"
+      ;;
+    windows)
+      printf '\nWindows 提醒：同一台电脑填 127.0.0.1；手机连 Windows 时填 Windows 局域网 IP，并确认防火墙允许端口 %s/%s。\n' "${brain_port}" "${gateway_port}"
+      ;;
+    mobile)
+      printf '\n手机提醒：同一台手机填 127.0.0.1；其它设备连手机时填手机局域网 IP，并保持 Termux 后台运行。\n'
+      ;;
+  esac
+
+  cat > connection_guide.txt <<EOF
+Ombre-Brain client connection guide
+
+Dashboard:
+  ${dashboard_url}
+
+MCP tool mode:
+  URL: ${mcp_url}
+
+Gateway / OpenAI-compatible:
+  Base URL: ${gateway_base_url}
+  API Key: value of OMBRE_GATEWAY_TOKEN in .env
+  Models endpoint: ${gateway_base_url}/models
+  Optional header: X-Ombre-Session-Id: main
+EOF
+  printf '\n已写入 connection_guide.txt\n'
+}
+
+start_mobile_runtime() {
+  local python_cmd
+  python_cmd="$(detect_python_cmd)" || return 1
+
+  if prompt_yes_no '现在安装/更新 Python 依赖吗' 'y'; then
+    "${python_cmd}" -m pip install -r requirements.txt || return 1
+  fi
+
+  mkdir -p logs state buckets
+  cat > start_mobile.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+PYTHON_CMD="${PYTHON_CMD:-python3}"
+if ! command -v "${PYTHON_CMD}" >/dev/null 2>&1; then
+  PYTHON_CMD="python"
+fi
+mkdir -p logs state buckets
+set -a
+source .env
+set +a
+export OMBRE_TRANSPORT=streamable-http
+export OMBRE_BUCKETS_DIR="${PWD}/buckets"
+export OMBRE_STATE_DIR="${PWD}/state"
+export OMBRE_GATEWAY_ADMIN_URL="http://127.0.0.1:8010/api/config"
+nohup "${PYTHON_CMD}" server.py > logs/ombre-brain.log 2>&1 &
+echo $! > state/ombre-brain.pid
+nohup "${PYTHON_CMD}" gateway.py > logs/ombre-gateway.log 2>&1 &
+echo $! > state/ombre-gateway.pid
+echo "Ombre-Brain started: http://127.0.0.1:8000/health"
+echo "Ombre-Gateway started: http://127.0.0.1:8010/health"
+EOF
+  chmod +x start_mobile.sh
+
+  if prompt_yes_no '现在后台启动手机服务吗' 'y'; then
+    PYTHON_CMD="${python_cmd}" ./start_mobile.sh
+  else
+    printf '已生成 start_mobile.sh；之后可执行：./start_mobile.sh\n'
+  fi
+}
+
+first_deploy() {
+  choose_deploy_target
+  line
+  printf '当前选择：%s\n' "${DEPLOY_LABEL}"
+  if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
+    printf '首次部署会生成 .env、config.yaml 和 start_mobile.sh。\n'
+  else
+    printf '首次部署会生成 .env、config.yaml、%s，并启动容器。\n' "${LOCAL_COMPOSE_FILE}"
+  fi
   printf '已有同名文件会先备份。\n'
   line
-  ensure_tools || return 1
+  if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
+    ensure_mobile_tools || return 1
+  else
+    ensure_tools || return 1
+  fi
 
   local ai_name user_name user_display_name
   ai_name="$(prompt_text 'AI 名字' 'Haven')"
@@ -547,8 +718,15 @@ first_deploy() {
   reflection_key="$(prompt_secret 'Reflection key（可回车，默认复用 OMBRE_API_KEY/Persona）' false)"
 
   local brain_port gateway_port
-  brain_port="$(prompt_text 'Ombre-Brain 对外端口' '18001')"
-  gateway_port="$(prompt_text 'Gateway 对外端口' '18002')"
+  if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
+    brain_port="${DEFAULT_BRAIN_PORT}"
+    gateway_port="${DEFAULT_GATEWAY_PORT}"
+    printf '手机直跑使用固定端口：Ombre-Brain=%s，Gateway=%s。\n' "${brain_port}" "${gateway_port}"
+  else
+    brain_port="$(prompt_text 'Ombre-Brain 对外端口' "${DEFAULT_BRAIN_PORT}")"
+    gateway_port="$(prompt_text 'Gateway 对外端口' "${DEFAULT_GATEWAY_PORT}")"
+  fi
+  choose_client_host
 
   write_env_file "${dehy_key}" "${embedding_key}" "${gateway_token}" "${dream_key}" "${persona_key}" "${reflection_key}"
   write_config_file \
@@ -558,14 +736,20 @@ first_deploy() {
     "${GATEWAY_UPSTREAMS_YAML}" \
     "${dream_enabled}" "${dream_base_url}" "${dream_model}" "${dream_probability}" \
     "${brain_port}" "${gateway_port}"
-  write_compose_file "${brain_port}" "${gateway_port}"
 
   mkdir -p buckets state
 
-  export COMPOSE_FILE="${LOCAL_COMPOSE_FILE}"
-  export HEALTH_URL="http://127.0.0.1:${brain_port}/health"
-  printf '\n开始构建并启动容器...\n'
-  "${SCRIPT_DIR}/update_deploy.sh"
+  if [[ "${DEPLOY_TARGET}" == "mobile" ]]; then
+    start_mobile_runtime || return 1
+  else
+    write_compose_file "${brain_port}" "${gateway_port}"
+    export COMPOSE_FILE="${LOCAL_COMPOSE_FILE}"
+    export HEALTH_URL="http://127.0.0.1:${brain_port}/health"
+    printf '\n开始构建并启动容器...\n'
+    "${SCRIPT_DIR}/update_deploy.sh"
+  fi
+
+  print_client_guide "${brain_port}" "${gateway_port}"
 }
 
 choose_compose_file() {
